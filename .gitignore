@@ -1,3 +1,4 @@
+agent-tools/
 node_modules/
 build/
 .wrangler/

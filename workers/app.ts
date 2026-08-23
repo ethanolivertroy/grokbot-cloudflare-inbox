@@ -3,12 +3,21 @@
 //     https://opensource.org/licenses/Apache-2.0
 
 import { routeAgentRequest } from "agents";
-import { Hono } from "hono";
+import { type Context, Hono } from "hono";
 import { jwtVerify, createRemoteJWKSet } from "jose";
 import { createRequestHandler } from "react-router";
 import { app as apiApp, receiveEmail } from "./index";
+import { lookupMailboxToken, parseBearerToken } from "./lib/mcp-tokens";
 import { EmailMCP } from "./mcp";
 import type { Env } from "./types";
+
+type WorkerContext = {
+	Bindings: Env;
+	Variables: {
+		pinnedMailboxId?: string;
+		pinnedFromAddress?: string;
+	};
+};
 
 export { MailboxDO } from "./durableObject";
 export { EmailAgent } from "./agent";
@@ -39,19 +48,51 @@ function getAccessUrls(teamDomain: string) {
 	return { issuer, certsUrl };
 }
 
-// Main app that wraps the API and adds React Router fallback
-const app = new Hono<{ Bindings: Env }>();
+const app = new Hono<WorkerContext>();
 
-// Cloudflare Access JWT validation middleware (production only)
+function isMcpPath(path: string): boolean {
+	return path === "/mcp" || path.startsWith("/mcp/");
+}
+
+function withMcpProps(
+	ctx: ExecutionContext,
+	mailboxId: string | undefined,
+	fromAddress?: string,
+): ExecutionContext {
+	(ctx as ExecutionContext & { props?: { mailboxId?: string; fromAddress?: string } }).props = mailboxId
+		? { mailboxId, fromAddress: fromAddress ?? mailboxId }
+		: {};
+	return ctx;
+}
+
+// Cloudflare Access JWT validation (production only).
+// /mcp accepts a mailbox-scoped Bearer token so Grok Bot can connect
+// without a browser Access JWT.
 app.use("*", async (c, next) => {
-	// Skip validation in development
+	if (isMcpPath(c.req.path)) {
+		const bearer = parseBearerToken(c.req.header("Authorization"));
+		if (bearer) {
+			const record = await lookupMailboxToken(c.env.BUCKET, bearer);
+			const mailboxExists =
+				record !== null &&
+				(await c.env.BUCKET.head(`mailboxes/${record.mailboxId}.json`));
+			if (!record || !mailboxExists) {
+				return c.text("Invalid mailbox token", 401, {
+					"WWW-Authenticate": 'Bearer realm="mcp", error="invalid_token"',
+				});
+			}
+			c.set("pinnedMailboxId", record.mailboxId);
+			c.set("pinnedFromAddress", record.fromAddress ?? record.mailboxId);
+			return next();
+		}
+	}
+
 	if (import.meta.env.DEV) {
 		return next();
 	}
 
 	const { POLICY_AUD, TEAM_DOMAIN } = c.env;
 
-	// Fail closed in production if Access is not configured.
 	if (!POLICY_AUD || !TEAM_DOMAIN) {
 		return c.text(
 			"Cloudflare Access must be configured in production. Set POLICY_AUD and TEAM_DOMAIN.",
@@ -75,39 +116,43 @@ app.use("*", async (c, next) => {
 		return c.text("Invalid or expired Access token", 403);
 	}
 
-	// Authorization model note: once a teammate passes the shared Cloudflare
-	// Access policy, they can access all mailboxes in this app by design.
+	// Authorization model: Access lets humans see every mailbox in the UI.
+	// Mailbox tokens on /mcp are the per-mailbox boundary for agents.
 	return next();
 });
 
-// MCP server endpoint — used by AI coding tools (ProtoAgent, Claude Code, Cursor, etc.)
-// Must be before API routes and React Router catch-all
 const mcpHandler = EmailMCP.serve("/mcp", { binding: "EMAIL_MCP" });
-app.all("/mcp", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
-app.all("/mcp/*", async (c) => {
-	return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as ExecutionContext);
-});
 
-// Mount the API routes
+async function handleMcp(c: Context<WorkerContext>) {
+	// Always use McpAgent.serve(). It addresses EmailMCP via getAgentByName
+	// so PartyServer gets namespace/room headers. A raw Durable Object
+	// stub.fetch() skips that and returns 500. Mailbox tokens stay pinned
+	// through ctx.props.mailboxId.
+	const ctx = withMcpProps(
+		c.executionCtx as ExecutionContext,
+		c.var.pinnedMailboxId,
+		c.var.pinnedFromAddress,
+	);
+	return mcpHandler.fetch(c.req.raw, c.env, ctx);
+}
+
+app.all("/mcp", async (c) => handleMcp(c));
+app.all("/mcp/*", async (c) => handleMcp(c));
+
 app.route("/", apiApp);
 
-// Agent WebSocket routing - must be before React Router catch-all
 app.all("/agents/*", async (c) => {
 	const response = await routeAgentRequest(c.req.raw, c.env);
 	if (response) return response;
 	return c.text("Agent not found", 404);
 });
 
-// React Router catch-all: serves the SPA for all non-API routes
 app.all("*", (c) => {
 	return requestHandler(c.req.raw, {
 		cloudflare: { env: c.env, ctx: c.executionCtx as ExecutionContext },
 	});
 });
 
-// Export the Hono app as the default export with an email handler
 export default {
 	fetch: app.fetch,
 	async email(
@@ -119,8 +164,6 @@ export default {
 			await receiveEmail(event, env, ctx);
 		} catch (e) {
 			console.error("Failed to process incoming email:", (e as Error).message, (e as Error).stack);
-			// Re-throw so Cloudflare's email routing can retry delivery or bounce the message.
-			// Swallowing the error would silently drop the email.
 			throw e;
 		}
 	},

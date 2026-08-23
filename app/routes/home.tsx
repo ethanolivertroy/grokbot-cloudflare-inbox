@@ -16,6 +16,8 @@ import { EnvelopeIcon, PlusIcon, TrashIcon } from "@phosphor-icons/react";
 import { useQuery } from "@tanstack/react-query";
 import { type FormEvent, useEffect, useRef, useState } from "react";
 import { Link as RouterLink } from "react-router";
+import AddressChips from "~/components/AddressChips";
+import { mailboxAliases, mailboxDisplayName } from "~/lib/mailbox-display";
 import api from "~/services/api";
 import {
 	useCreateMailbox,
@@ -25,7 +27,7 @@ import {
 import { queryKeys } from "~/queries/keys";
 
 export function meta() {
-	return [{ title: "Agentic Inbox" }];
+	return [{ title: "Grok Bot Inbox" }];
 }
 
 export default function HomeRoute() {
@@ -69,7 +71,10 @@ export default function HomeRoute() {
 		if (autoCreateDone.current) return;
 		if (emailAddresses.length === 0 || !mailboxesFetched) return;
 		const existingEmails = new Set(
-			mailboxes.map((m) => m.email.toLowerCase()),
+			mailboxes.flatMap((m) => [
+				m.email.toLowerCase(),
+				...mailboxAliases(m).map((alias) => alias.toLowerCase()),
+			]),
 		);
 		const toCreate = emailAddresses.filter(
 			(addr) => !existingEmails.has(addr.toLowerCase()),
@@ -129,13 +134,27 @@ export default function HomeRoute() {
 	};
 
 	const isConfigured = emailAddresses.length > 0;
+	const aliasSet = new Set(
+		mailboxes.flatMap((m) =>
+			mailboxAliases(m).map((alias) => alias.toLowerCase()),
+		),
+	);
 	const accounts = isConfigured
-		? emailAddresses.map((addr) => ({
-				id: addr,
-				email: addr,
-				name: addr.split("@")[0] || addr,
-			}))
+		? emailAddresses
+				.filter((addr) => !aliasSet.has(addr.toLowerCase()))
+				.map((addr) => ({
+					id: addr,
+					email: addr,
+					name: addr.split("@")[0] || addr,
+				}))
 		: mailboxes;
+
+	const aliasesFor = (email: string): string[] => {
+		const mailbox = mailboxes.find(
+			(item) => item.email.toLowerCase() === email.toLowerCase(),
+		);
+		return mailboxAliases(mailbox);
+	};
 
 	const isLoading = !configData;
 
@@ -143,8 +162,20 @@ export default function HomeRoute() {
 		<div className="min-h-screen bg-kumo-recessed">
 			<div className="mx-auto max-w-2xl px-4 py-8 md:px-6 md:py-16">
 				<div className="mb-8">
-					<div className="flex items-center justify-between">
-						<h1 className="text-2xl font-bold text-kumo-default">Mailboxes</h1>
+					<div className="flex items-end justify-between gap-4">
+						<div>
+							<p className="text-xs font-medium uppercase tracking-wider text-kumo-subtle mb-1">
+								Grok Bot Inbox
+							</p>
+							<h1 className="text-2xl font-semibold text-kumo-default">
+								Mailboxes
+							</h1>
+							<p className="text-sm text-kumo-subtle mt-1">
+								{domains.length > 0
+									? domains.join(", ")
+									: "Addresses you own on this Worker"}
+							</p>
+						</div>
 						{!isConfigured && (
 							<Button
 								variant="primary"
@@ -155,11 +186,6 @@ export default function HomeRoute() {
 							</Button>
 						)}
 					</div>
-					{domains.length > 0 && (
-						<p className="text-sm text-kumo-subtle mt-1">
-							{domains.join(", ")}
-						</p>
-					)}
 				</div>
 
 				{isLoading ? (
@@ -181,11 +207,22 @@ export default function HomeRoute() {
 								</div>
 								<div className="min-w-0 flex-1">
 									<div className="text-sm font-medium text-kumo-default truncate">
-										{account.name}
+										{mailboxDisplayName(
+											mailboxes.find(
+												(item) =>
+													item.email.toLowerCase() ===
+													account.email.toLowerCase(),
+											) ?? {
+												id: account.id,
+												email: account.email,
+												name: account.name,
+											},
+										)}
 									</div>
-									<div className="text-sm text-kumo-subtle">
+									<div className="text-sm text-kumo-subtle truncate">
 										{account.email}
 									</div>
+									<AddressChips addresses={aliasesFor(account.email)} />
 								</div>
 								{!isConfigured && (
 									<Button

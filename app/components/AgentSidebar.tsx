@@ -2,9 +2,12 @@
 // Licensed under the Apache 2.0 license found in the LICENSE file or at:
 //     https://opensource.org/licenses/Apache-2.0
 
-import { Loader } from "@cloudflare/kumo";
-import { PlugsIcon, RobotIcon } from "@phosphor-icons/react";
+import { Button, Loader, Tooltip } from "@cloudflare/kumo";
+import { PlugsIcon, RobotIcon, XIcon } from "@phosphor-icons/react";
 import { useEffect, useState } from "react";
+import { useParams } from "react-router";
+import { useUIStore } from "~/hooks/useUIStore";
+import { useMailboxTokens } from "~/queries/mailboxes";
 import MCPPanel from "./MCPPanel";
 
 function LazyAgentPanel() {
@@ -41,15 +44,29 @@ function LazyAgentPanel() {
 }
 
 export default function AgentSidebar() {
+	const { mailboxId } = useParams<{ mailboxId: string }>();
+	const { data: tokens = [], isFetched } = useMailboxTokens(mailboxId);
+	const [userPicked, setUserPicked] = useState(false);
 	const [activeTab, setActiveTab] = useState<"agent" | "mcp">("agent");
+
+	useEffect(() => {
+		if (userPicked || !isFetched) return;
+		if (tokens.length === 0) setActiveTab("mcp");
+	}, [isFetched, tokens.length, userPicked]);
+
+	const toggleAgentPanel = useUIStore((state) => state.toggleAgentPanel);
+
+	const selectTab = (tab: "agent" | "mcp") => {
+		setUserPicked(true);
+		setActiveTab(tab);
+	};
 
 	return (
 		<div className="flex flex-col h-full">
-			{/* Tab bar */}
 			<div className="flex items-center border-b border-kumo-line shrink-0">
 				<button
 					type="button"
-					onClick={() => setActiveTab("agent")}
+					onClick={() => selectTab("agent")}
 					className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 bg-transparent cursor-pointer ${
 						activeTab === "agent"
 							? "border-kumo-brand text-kumo-default"
@@ -61,7 +78,7 @@ export default function AgentSidebar() {
 				</button>
 				<button
 					type="button"
-					onClick={() => setActiveTab("mcp")}
+					onClick={() => selectTab("mcp")}
 					className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium transition-colors border-b-2 bg-transparent cursor-pointer ${
 						activeTab === "mcp"
 							? "border-kumo-brand text-kumo-default"
@@ -69,11 +86,22 @@ export default function AgentSidebar() {
 					}`}
 				>
 					<PlugsIcon size={14} weight={activeTab === "mcp" ? "fill" : "regular"} />
-					MCP
+					Connect
 				</button>
+				<div className="ml-auto pr-1">
+					<Tooltip content="Hide panel" asChild>
+						<Button
+							variant="ghost"
+							shape="square"
+							size="sm"
+							icon={<XIcon size={14} />}
+							onClick={toggleAgentPanel}
+							aria-label="Hide agent and Connect"
+						/>
+					</Tooltip>
+				</div>
 			</div>
 
-			{/* Tab content — keep agent mounted so chat isn't lost */}
 			<div className="flex-1 min-h-0 overflow-hidden">
 				<div className={activeTab === "agent" ? "h-full" : "hidden"}>
 					<LazyAgentPanel />

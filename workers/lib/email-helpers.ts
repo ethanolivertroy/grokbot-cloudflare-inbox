@@ -13,6 +13,12 @@ import type { EmailFull } from "./schemas";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
 import { formatQuotedDate } from "../../shared/dates";
+import {
+	getMailboxAddresses,
+	isMailboxSettingsKey,
+	normalizeAliases,
+	readMailboxSettings,
+} from "./mailbox-addresses";
 
 // ── DO Stub ────────────────────────────────────────────────────────
 
@@ -32,34 +38,51 @@ export function getMailboxStub(
 // ── Mailbox Listing ────────────────────────────────────────────────
 
 /**
- * List all mailboxes from R2 bucket metadata.
+ * List mailbox settings objects only (ignore token listings under mailboxes/{id}/).
  */
 export async function listMailboxes(
 	bucket: R2Bucket,
-): Promise<{ id: string; email: string }[]> {
+): Promise<{ id: string; email: string; aliases: string[] }[]> {
 	const list = await bucket.list({ prefix: "mailboxes/" });
-	return list.objects.map((obj) => {
-		const id = obj.key.replace("mailboxes/", "").replace(".json", "");
-		return { id, email: id };
-	});
+	const mailboxes: { id: string; email: string; aliases: string[] }[] = [];
+	for (const obj of list.objects) {
+		if (!isMailboxSettingsKey(obj.key)) continue;
+		const id = obj.key.replace("mailboxes/", "").replace(/\.json$/, "");
+		const settings = await readMailboxSettings(bucket, id);
+		mailboxes.push({
+			id,
+			email: id,
+			aliases: normalizeAliases(settings?.aliases, id),
+		});
+	}
+	return mailboxes;
 }
 
 // ── Sender Validation ──────────────────────────────────────────────
 
 /**
- * Normalise to/from addresses and validate the sender matches the mailbox.
- * Returns the normalised values or throws with a user-facing message.
+ * Normalise to/from addresses and validate the sender is this mailbox
+ * or one of its aliases.
  */
 export function validateSender(
 	to: string | string[],
 	from: string | { email: string; name: string },
 	mailboxId: string,
+	allowedFrom?: string[],
 ): { toStr: string; fromEmail: string; fromDomain: string } {
 	const toStr = (Array.isArray(to) ? to.join(", ") : to).toLowerCase();
 	const fromEmail = (typeof from === "string" ? from : from.email).toLowerCase();
+	const allowed = (allowedFrom && allowedFrom.length > 0
+		? allowedFrom
+		: [mailboxId]
+	).map((address) => address.toLowerCase());
 
-	if (fromEmail !== mailboxId.toLowerCase()) {
-		throw new SenderValidationError("From address must match the mailbox email address");
+	if (!allowed.includes(fromEmail)) {
+		throw new SenderValidationError(
+			allowed.length > 1
+				? "From address must be the mailbox email or one of its aliases"
+				: "From address must match the mailbox email address",
+		);
 	}
 
 	const fromDomain = fromEmail.split("@")[1];
@@ -68,6 +91,16 @@ export function validateSender(
 	}
 
 	return { toStr, fromEmail, fromDomain };
+}
+
+export async function validateSenderForMailbox(
+	bucket: R2Bucket,
+	to: string | string[],
+	from: string | { email: string; name: string },
+	mailboxId: string,
+): Promise<{ toStr: string; fromEmail: string; fromDomain: string }> {
+	const allowedFrom = await getMailboxAddresses(bucket, mailboxId);
+	return validateSender(to, from, mailboxId, allowedFrom);
 }
 
 export class SenderValidationError extends Error {

@@ -22,6 +22,12 @@ import {
 } from "../lib/tools";
 import { Folders, FOLDER_TOOL_DESCRIPTION, MOVE_FOLDER_TOOL_DESCRIPTION } from "../../shared/folders";
 import type { Env } from "../types";
+import { normalizeAliases, readMailboxSettings } from "../lib/mailbox-addresses";
+
+type McpProps = {
+	mailboxId?: string;
+	fromAddress?: string;
+};
 
 /** Wrap a plain result object into MCP content format. */
 function mcpText(result: unknown) {
@@ -54,26 +60,49 @@ function mcpResult(result: Record<string, unknown>) {
 	return mcpText(result);
 }
 
+const mailboxIdField = z
+	.string()
+	.optional()
+	.describe(
+		"Mailbox address. Omit when connected with a mailbox token; the token already selects the mailbox.",
+	);
+
+function pinnedMailboxId(agent: EmailMCP): string | undefined {
+	const fromProps = agent.props?.mailboxId;
+	if (typeof fromProps === "string" && fromProps.includes("@")) {
+		return fromProps.toLowerCase();
+	}
+	const name = agent.name;
+	if (typeof name === "string" && name.startsWith("mailbox:")) {
+		return name.slice("mailbox:".length).toLowerCase();
+	}
+	return undefined;
+}
+
+function pinnedFromAddress(agent: EmailMCP, mailboxId: string): string {
+	const fromProps = agent.props?.fromAddress;
+	if (typeof fromProps === "string" && fromProps.includes("@")) {
+		return fromProps.toLowerCase();
+	}
+	return mailboxId;
+}
+
 /**
  * EmailMCP — exposes email tools over the Model Context Protocol.
  *
- * Clients (ProtoAgent, Claude Code, Cursor, etc.) connect to the
- * `/mcp` endpoint and can list mailboxes, read/search emails,
- * draft replies, send messages, and manage folders.
+ * Mailbox tokens pin the inbox so Grok Bot and other agents do not pass
+ * mailboxId. A Cloudflare Access session can still choose any mailbox.
  */
-export class EmailMCP extends McpAgent<Env> {
+export class EmailMCP extends McpAgent<Env, unknown, McpProps> {
 	server = new McpServer({
-		name: "agentic-inbox",
+		name: "grokbot-inbox",
 		version: "1.0.0",
 	});
 
 	async init() {
 		const env = this.env;
+		const agent = this;
 
-		/**
-		 * Verify a mailbox exists in R2 before operating on it.
-		 * Returns an MCP error response if the mailbox is not found, or null if valid.
-		 */
 		const verifyMailbox = async (mailboxId: string) => {
 			const obj = await env.BUCKET.head(`mailboxes/${mailboxId}.json`);
 			if (!obj) {
@@ -82,12 +111,37 @@ export class EmailMCP extends McpAgent<Env> {
 			return null;
 		};
 
+		const resolveMailbox = async (requested: string | undefined) => {
+			const pinned = pinnedMailboxId(agent);
+			const mailboxId = (requested ?? pinned)?.toLowerCase();
+			if (!mailboxId) {
+				return {
+					error: mcpError(
+						"mailboxId is required. Create a mailbox token in the app and connect with it, or pass mailboxId.",
+					),
+				};
+			}
+			if (pinned && mailboxId !== pinned) {
+				return { error: mcpError(`This token can only access ${pinned}.`) };
+			}
+			const denied = await verifyMailbox(mailboxId);
+			if (denied) return { error: denied };
+			return { mailboxId };
+		};
+
 		// ── list_mailboxes ─────────────────────────────────────────
 		this.server.tool(
 			"list_mailboxes",
-			"List all available mailboxes",
+			"List mailboxes this connection can use. A mailbox token returns only its pinned inbox.",
 			{},
 			async () => {
+				const pinned = pinnedMailboxId(agent);
+				if (pinned) {
+					const settings = await readMailboxSettings(env.BUCKET, pinned);
+					const aliases = normalizeAliases(settings?.aliases, pinned);
+					const fromAddress = pinnedFromAddress(agent, pinned);
+					return mcpText([{ id: pinned, email: pinned, aliases, fromAddress }]);
+				}
 				const result = await toolListMailboxes(env);
 				return mcpText(result);
 			},
@@ -98,9 +152,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"list_emails",
 			"List emails in a mailbox folder. Returns email metadata (id, subject, sender, recipient, date, read/starred status, thread_id).",
 			{
-				mailboxId: z
-					.string()
-					.describe("The mailbox email address (e.g. user@example.com)"),
+				mailboxId: mailboxIdField,
 				folder: z
 					.string()
 					.default(Folders.INBOX)
@@ -115,9 +167,9 @@ export class EmailMCP extends McpAgent<Env> {
 					.describe("Page number for pagination"),
 			},
 			async ({ mailboxId, folder, limit, page }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolListEmails(env, mailboxId, { folder, limit, page });
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolListEmails(env, resolved.mailboxId, { folder, limit, page });
 				return mcpText(result);
 			},
 		);
@@ -127,13 +179,13 @@ export class EmailMCP extends McpAgent<Env> {
 			"get_email",
 			"Get a single email with its full body content. Use this to read the actual content of an email.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				emailId: z.string().describe("The email ID to retrieve"),
 			},
 			async ({ mailboxId, emailId }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolGetEmail(env, mailboxId, emailId);
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolGetEmail(env, resolved.mailboxId, emailId);
 				if ("error" in result) {
 					return {
 						content: [{ type: "text" as const, text: "Email not found" }],
@@ -149,15 +201,15 @@ export class EmailMCP extends McpAgent<Env> {
 			"get_thread",
 			"Get all emails in a conversation thread. Returns all messages sorted chronologically.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				threadId: z
 					.string()
 					.describe("The thread_id to retrieve all messages for"),
 			},
 			async ({ mailboxId, threadId }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolGetThread(env, mailboxId, threadId);
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolGetThread(env, resolved.mailboxId, threadId);
 				return mcpText(result);
 			},
 		);
@@ -167,7 +219,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"search_emails",
 			"Search for emails matching a query across subject and body fields.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				query: z.string().describe("Search query to match against subject and body"),
 				folder: z
 					.string()
@@ -175,9 +227,9 @@ export class EmailMCP extends McpAgent<Env> {
 					.describe("Optional folder to restrict search to"),
 			},
 			async ({ mailboxId, query, folder }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolSearchEmails(env, mailboxId, { query, folder });
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolSearchEmails(env, resolved.mailboxId, { query, folder });
 				return mcpText(result);
 			},
 		);
@@ -187,7 +239,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"draft_reply",
 			"Draft a reply to an email and save it to the Drafts folder. Does NOT send — saves a draft for review.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				originalEmailId: z
 					.string()
 					.describe("The ID of the email being replied to"),
@@ -198,9 +250,9 @@ export class EmailMCP extends McpAgent<Env> {
 					.describe("The HTML body of the reply"),
 			},
 			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolDraftReply(env, mailboxId, {
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolDraftReply(env, resolved.mailboxId, {
 					originalEmailId,
 					to,
 					subject,
@@ -217,7 +269,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"create_draft",
 			"Create a new draft email. Can be a new email or a reply draft.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				to: z
 					.string()
 					.optional()
@@ -234,9 +286,9 @@ export class EmailMCP extends McpAgent<Env> {
 					.describe("Thread ID to attach this draft to (optional)"),
 			},
 			async ({ mailboxId, to, subject, bodyHtml, in_reply_to, thread_id }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolDraftEmail(env, mailboxId, {
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolDraftEmail(env, resolved.mailboxId, {
 					to: to || "",
 					subject,
 					body: bodyHtml,
@@ -263,7 +315,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"update_draft",
 			"Update an existing draft email's content.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				draftId: z.string().describe("The ID of the draft to update"),
 				to: z
 					.string()
@@ -273,9 +325,9 @@ export class EmailMCP extends McpAgent<Env> {
 				bodyHtml: z.string().optional().describe("Updated HTML body"),
 			},
 			async ({ mailboxId, draftId, to, subject, bodyHtml }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolUpdateDraft(env, mailboxId, {
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolUpdateDraft(env, resolved.mailboxId, {
 					draftId,
 					to,
 					subject,
@@ -299,13 +351,13 @@ export class EmailMCP extends McpAgent<Env> {
 			"delete_email",
 			"Permanently delete an email by ID.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				emailId: z.string().describe("The email ID to delete"),
 			},
 			async ({ mailboxId, emailId }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolDeleteEmail(env, mailboxId, emailId);
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolDeleteEmail(env, resolved.mailboxId, emailId);
 				return mcpResult(result);
 			},
 		);
@@ -315,7 +367,7 @@ export class EmailMCP extends McpAgent<Env> {
 			"send_reply",
 			"Send a reply to an email. Only call after drafting and getting confirmation.",
 			{
-				mailboxId: z.string().describe("The mailbox email address to send from"),
+				mailboxId: mailboxIdField,
 				originalEmailId: z
 					.string()
 					.describe("The ID of the email being replied to"),
@@ -324,13 +376,14 @@ export class EmailMCP extends McpAgent<Env> {
 				bodyHtml: z.string().describe("The HTML body of the reply"),
 			},
 			async ({ mailboxId, originalEmailId, to, subject, bodyHtml }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolSendReply(env, mailboxId, {
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolSendReply(env, resolved.mailboxId, {
 					originalEmailId,
 					to,
 					subject,
 					bodyHtml,
+					fromAddress: pinnedFromAddress(agent, resolved.mailboxId),
 				});
 				if ("error" in result) {
 					// Preserve the original MCP error format for send failures
@@ -357,18 +410,19 @@ export class EmailMCP extends McpAgent<Env> {
 			"send_email",
 			"Send a new email (not a reply). Only call after getting confirmation.",
 			{
-				mailboxId: z.string().describe("The mailbox email address to send from"),
+				mailboxId: mailboxIdField,
 				to: z.string().email().describe("Recipient email address"),
 				subject: z.string().describe("Subject line"),
 				bodyHtml: z.string().describe("The HTML body of the email"),
 			},
 			async ({ mailboxId, to, subject, bodyHtml }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolSendEmail(env, mailboxId, {
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolSendEmail(env, resolved.mailboxId, {
 					to,
 					subject,
 					bodyHtml,
+					fromAddress: pinnedFromAddress(agent, resolved.mailboxId),
 				});
 				if ("error" in result) {
 					if (typeof result.error === "string" && result.error.startsWith("Failed to send")) {
@@ -388,14 +442,14 @@ export class EmailMCP extends McpAgent<Env> {
 			"mark_email_read",
 			"Mark an email as read or unread.",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				emailId: z.string().describe("The email ID"),
 				read: z.boolean().describe("true to mark as read, false for unread"),
 			},
 			async ({ mailboxId, emailId, read }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolMarkEmailRead(env, mailboxId, emailId, read);
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolMarkEmailRead(env, resolved.mailboxId, emailId, read);
 				return mcpText(result);
 			},
 		);
@@ -405,16 +459,16 @@ export class EmailMCP extends McpAgent<Env> {
 			"move_email",
 			"Move an email to a different folder (inbox, sent, draft, archive, trash).",
 			{
-				mailboxId: z.string().describe("The mailbox email address"),
+				mailboxId: mailboxIdField,
 				emailId: z.string().describe("The email ID"),
 				folderId: z
 					.string()
 					.describe(MOVE_FOLDER_TOOL_DESCRIPTION),
 			},
 			async ({ mailboxId, emailId, folderId }) => {
-				const denied = await verifyMailbox(mailboxId);
-				if (denied) return denied;
-				const result = await toolMoveEmail(env, mailboxId, emailId, folderId);
+				const resolved = await resolveMailbox(mailboxId);
+				if ("error" in resolved) return resolved.error;
+				const result = await toolMoveEmail(env, resolved.mailboxId, emailId, folderId);
 				if ("error" in result) {
 					return {
 						content: [

@@ -88,7 +88,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
 					sizes="48x48 32x32 16x16"
 				/>
 				<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-				<title>Agentic Inbox</title>
+				<title>Grok Bot Inbox</title>
 				<Meta />
 				<Links />
 			</head>

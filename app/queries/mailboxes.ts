@@ -50,6 +50,44 @@ export function useUpdateMailbox() {
 	});
 }
 
+export function useMailboxTokens(mailboxId: string | undefined) {
+	return useQuery({
+		queryKey: mailboxId
+			? queryKeys.tokens.list(mailboxId)
+			: ["tokens", "_disabled"],
+		queryFn: () => api.listMailboxTokens(mailboxId!),
+		enabled: !!mailboxId,
+	});
+}
+
+export function useCreateMailboxToken() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			fromAddress,
+		}: { mailboxId: string; fromAddress?: string }) =>
+			api.createMailboxToken(mailboxId, fromAddress),
+		onSuccess: (_data, { mailboxId }) => {
+			qc.invalidateQueries({ queryKey: queryKeys.tokens.list(mailboxId) });
+		},
+	});
+}
+
+export function useRevokeMailboxToken() {
+	const qc = useQueryClient();
+	return useMutation({
+		mutationFn: ({
+			mailboxId,
+			tokenId,
+		}: { mailboxId: string; tokenId: string }) =>
+			api.revokeMailboxToken(mailboxId, tokenId),
+		onSuccess: (_data, { mailboxId }) => {
+			qc.invalidateQueries({ queryKey: queryKeys.tokens.list(mailboxId) });
+		},
+	});
+}
+
 export function useDeleteMailbox() {
 	const qc = useQueryClient();
 	return useMutation({

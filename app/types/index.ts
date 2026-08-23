@@ -14,12 +14,17 @@ export interface MailboxSettings {
 	signature?: SignatureSettings;
 	autoReply?: { enabled: boolean; subject: string; message: string };
 	agentSystemPrompt?: string;
+	agentModel?: string;
+	injectionModel?: string;
+	verifierModel?: string;
+	aliases?: string[];
 }
 
 export interface Mailbox {
 	id: string;
 	email: string;
 	name: string;
+	aliases?: string[];
 	settings?: MailboxSettings;
 }
 

@@ -10,7 +10,11 @@ import tsconfigPaths from "vite-tsconfig-paths";
 
 export default defineConfig({
   plugins: [
-    cloudflare({ viteEnvironment: { name: "ssr" } }),
+    cloudflare({
+      viteEnvironment: { name: "ssr" },
+      // Local preview should not open a Wrangler OAuth remote-proxy session.
+      remoteBindings: false,
+    }),
     tailwindcss(),
     reactRouter(),
     tsconfigPaths(),

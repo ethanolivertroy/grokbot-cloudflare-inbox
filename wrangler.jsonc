@@ -1,6 +1,6 @@
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "agentic-inbox",
+	"name": "grokbot-inbox",
 	"compatibility_date": "2025-11-28",
 	"main": "./workers/app.ts",
 	"observability": {
@@ -14,19 +14,21 @@
 		// TEAM_DOMAIN may be the base Access URL or the full /cdn-cgi/access/certs URL.
 		// The worker now fails closed outside local development if Access is not configured.
 		"DOMAINS": "example.com",
-		"EMAIL_ADDRESSES": []
+		"EMAIL_ADDRESSES": [],
+		"AGENT_MODEL": "@cf/moonshotai/kimi-k2.5",
+		"INJECTION_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast",
+		"VERIFIER_MODEL": "@cf/meta/llama-4-scout-17b-16e-instruct"
 	},
 	"send_email": [
 		{
-			"name": "EMAIL",
-			"remote": true
+			"name": "EMAIL"
 		}
 	],
 	"r2_buckets": [
 		{
 			"binding": "BUCKET",
-			"bucket_name": "agentic-inbox",
-			"preview_bucket_name": "agentic-inbox"
+			"bucket_name": "grokbot-inbox",
+			"preview_bucket_name": "grokbot-inbox"
 		}
 	],
 	"ai": {

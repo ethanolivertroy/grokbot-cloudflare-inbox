@@ -26,7 +26,9 @@ import {
 	buildReferencesChain,
 	buildThreadingHeaders,
 } from "./email-helpers";
+import { getMailboxAddresses } from "./mailbox-addresses";
 import { verifyDraft } from "./ai";
+import { resolveMailboxModels } from "./models";
 import { sendEmail } from "../email-sender";
 import { Folders } from "../../shared/folders";
 import type { Env } from "../types";
@@ -42,6 +44,11 @@ type MailboxSearchStub = {
 type RateLimitStub = {
 	checkSendRateLimit: () => Promise<string | null>;
 };
+
+async function verifyMailboxDraft(env: Env, mailboxId: string, body: string) {
+	const models = await resolveMailboxModels(env, mailboxId);
+	return verifyDraft(env.AI, body, models.verifier);
+}
 
 // ── list_mailboxes ─────────────────────────────────────────────────
 
@@ -136,7 +143,7 @@ export async function toolDraftReply(
 	// Verify/sanitize if requested
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
-		const sanitized = await verifyDraft(env.AI, processedBody);
+		const sanitized = await verifyMailboxDraft(env, mailboxId, processedBody);
 		if (!sanitized) {
 			return { error: "Draft verification failed — body could not be verified. Please try again." };
 		}
@@ -217,7 +224,7 @@ export async function toolDraftEmail(
 
 	let processedBody = params.body.trim();
 	if (params.runVerifyDraft) {
-		const sanitized = await verifyDraft(env.AI, processedBody);
+		const sanitized = await verifyMailboxDraft(env, mailboxId, processedBody);
 		if (!sanitized) {
 			return { error: "Draft verification failed — body could not be verified. Please try again." };
 		}
@@ -294,7 +301,7 @@ export async function toolUpdateDraft(
 	// Verify the body BEFORE deleting the old draft to prevent data loss
 	const newDraftId = crypto.randomUUID();
 	const rawBody = params.bodyHtml ?? oldDraft.body ?? "";
-	const verifiedBody = await verifyDraft(env.AI, rawBody);
+	const verifiedBody = await verifyMailboxDraft(env, mailboxId, rawBody);
 
 	if (!verifiedBody) {
 		return { error: "Draft verification failed — keeping existing draft unchanged. Please try again." };
@@ -398,6 +405,7 @@ export async function toolSendReply(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		fromAddress?: string;
 	},
 ): Promise<
 	| { status: "sent"; messageId: string; message: string }
@@ -417,12 +425,17 @@ export async function toolSendReply(
 	}
 
 	const { originalMsgId, references, threadId } = buildReferencesChain(originalEmail);
-	const fromDomain = mailboxId.split("@")[1];
+	const fromAddress = (params.fromAddress ?? mailboxId).toLowerCase();
+	const allowedFrom = await getMailboxAddresses(env.BUCKET, mailboxId);
+	if (!allowedFrom.includes(fromAddress)) {
+		return { error: "From address must be the mailbox email or one of its aliases" };
+	}
+	const fromDomain = fromAddress.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
 	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
 
 	// Verify and append quoted original message
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
+	const sanitizedBody = await verifyMailboxDraft(env, mailboxId, params.bodyHtml);
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
@@ -436,7 +449,7 @@ export async function toolSendReply(
 	try {
 		await sendEmail(env.EMAIL, {
 			to: params.to,
-			from: mailboxId,
+			from: fromAddress,
 			subject: params.subject,
 			html: fullBodyHtml,
 			headers: buildThreadingHeaders(originalMsgId, references),
@@ -451,7 +464,7 @@ export async function toolSendReply(
 		{
 			id: messageId,
 			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
+			sender: fromAddress,
 			recipient: params.to.toLowerCase(),
 			date: new Date().toISOString(),
 			body: fullBodyHtml,
@@ -476,6 +489,7 @@ export async function toolSendEmail(
 		to: string;
 		subject: string;
 		bodyHtml: string;
+		fromAddress?: string;
 	},
 ): Promise<
 	| { status: "sent"; messageId: string; message: string }
@@ -489,11 +503,16 @@ export async function toolSendEmail(
 		return { error: rateLimitError };
 	}
 
-	const fromDomain = mailboxId.split("@")[1];
+	const fromAddress = (params.fromAddress ?? mailboxId).toLowerCase();
+	const allowedFrom = await getMailboxAddresses(env.BUCKET, mailboxId);
+	if (!allowedFrom.includes(fromAddress)) {
+		return { error: "From address must be the mailbox email or one of its aliases" };
+	}
+	const fromDomain = fromAddress.split("@")[1];
 	if (!fromDomain) throw new Error("Invalid mailbox email address");
 	const { messageId, outgoingMessageId } = generateMessageId(fromDomain);
 
-	const sanitizedBody = await verifyDraft(env.AI, params.bodyHtml);
+	const sanitizedBody = await verifyMailboxDraft(env, mailboxId, params.bodyHtml);
 	if (!sanitizedBody) {
 		return { error: "Draft verification failed — refusing to send unverified content. Please try again." };
 	}
@@ -501,7 +520,7 @@ export async function toolSendEmail(
 	try {
 		await sendEmail(env.EMAIL, {
 			to: params.to,
-			from: mailboxId,
+			from: fromAddress,
 			subject: params.subject,
 			html: sanitizedBody,
 		});
@@ -515,7 +534,7 @@ export async function toolSendEmail(
 		{
 			id: messageId,
 			subject: params.subject,
-			sender: mailboxId.toLowerCase(),
+			sender: fromAddress,
 			recipient: params.to.toLowerCase(),
 			date: new Date().toISOString(),
 			body: sanitizedBody,

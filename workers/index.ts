@@ -9,7 +9,7 @@ import { z } from "zod";
 import { sendEmail } from "./email-sender";
 import { storeAttachments, type StoredAttachment } from "./lib/attachments";
 import {
-	validateSender,
+	validateSenderForMailbox,
 	SenderValidationError,
 	generateMessageId,
 	buildThreadingHeaders,
@@ -20,6 +20,24 @@ import { handleReplyEmail, handleForwardEmail } from "./routes/reply-forward";
 import { Folders } from "../shared/folders";
 import type { Env } from "./types";
 import { requireMailbox, type MailboxContext } from "./lib/mailbox";
+import {
+	AliasConflictError,
+	assertAddressAvailable,
+	assertAliasAllowedByConfig,
+	deleteMailboxAliases,
+	getMailboxAddresses,
+	normalizeAliases,
+	readMailboxSettings,
+	replaceMailboxAliases,
+	resolveInboundMailbox,
+} from "./lib/mailbox-addresses";
+import {
+	createMailboxToken,
+	listMailboxTokens,
+	revokeAllMailboxTokens,
+	revokeMailboxToken,
+	TokenLimitError,
+} from "./lib/mcp-tokens";
 
 type AppContext = Context<MailboxContext>;
 
@@ -28,7 +46,11 @@ type AppContext = Context<MailboxContext>;
 const CreateMailboxBody = z.object({
 	email: z.string().email(),
 	name: z.string().min(1),
-	settings: z.record(z.any()).optional(), // unvalidated — agentSystemPrompt goes straight to AI
+	settings: z.record(z.any()).optional(), // unvalidated: prompt and model IDs go to Workers AI
+});
+
+const CreateTokenBody = z.object({
+	fromAddress: z.string().email().optional(),
 });
 
 const DraftBody = z.object({
@@ -108,36 +130,118 @@ app.post("/api/v1/mailboxes", async (c) => {
 	}
 	const key = `mailboxes/${email}.json`;
 	if (await c.env.BUCKET.head(key)) return c.json({ error: "Mailbox already exists" }, 409);
-	const defaultSettings = { fromName: name, forwarding: { enabled: false, email: "" }, signature: { enabled: false, text: "" }, autoReply: { enabled: false, subject: "", message: "" } };
-	const finalSettings = { ...defaultSettings, ...settings };
+	try {
+		await assertAddressAvailable(c.env.BUCKET, email);
+	} catch (e) {
+		if (e instanceof AliasConflictError) return c.json({ error: e.message }, 409);
+		throw e;
+	}
+	const incomingAliases = normalizeAliases(settings?.aliases, email);
+	const defaultSettings = {
+		fromName: name,
+		forwarding: { enabled: false, email: "" },
+		signature: { enabled: false, text: "" },
+		autoReply: { enabled: false, subject: "", message: "" },
+		aliases: [] as string[],
+	};
+	const finalSettings = { ...defaultSettings, ...settings, aliases: incomingAliases };
+	if (incomingAliases.length > 0) {
+		const domains = (c.env.DOMAINS || "").split(",").map((d) => d.trim()).filter(Boolean);
+		try {
+			for (const alias of incomingAliases) {
+				assertAliasAllowedByConfig(alias, { domains, emailAddresses: allowedAddresses });
+			}
+			await replaceMailboxAliases(c.env.BUCKET, email, [], incomingAliases);
+		} catch (e) {
+			if (e instanceof AliasConflictError) return c.json({ error: e.message }, 409);
+			throw e;
+		}
+	}
 	await c.env.BUCKET.put(key, JSON.stringify(finalSettings));
 	const stub = c.env.MAILBOX.get(c.env.MAILBOX.idFromName(email));
 	await stub.getFolders();
-	return c.json({ id: email, email, name, settings: finalSettings }, 201);
+	return c.json({ id: email, email, name, aliases: incomingAliases, settings: finalSettings }, 201);
 });
 
 app.get("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const obj = await c.env.BUCKET.get(`mailboxes/${mailboxId}.json`);
-	if (!obj) return c.json({ error: "Not found" }, 404);
-	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings: await obj.json() });
+	const settings = await readMailboxSettings(c.env.BUCKET, mailboxId);
+	if (!settings) return c.json({ error: "Not found" }, 404);
+	const aliases = normalizeAliases(settings.aliases, mailboxId);
+	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, aliases, settings });
 });
 
 app.put("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
 	const { settings } = (await c.req.json()) as { settings: Record<string, unknown> };
-	const key = `mailboxes/${mailboxId}.json`;
-	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.put(key, JSON.stringify(settings));
-	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, settings });
+	const existing = await readMailboxSettings(c.env.BUCKET, mailboxId);
+	if (!existing) return c.json({ error: "Not found" }, 404);
+	const previousAliases = normalizeAliases(existing.aliases, mailboxId);
+	const nextAliases = Array.isArray(settings.aliases)
+		? normalizeAliases(settings.aliases, mailboxId)
+		: previousAliases;
+	if (Array.isArray(settings.aliases)) {
+		const domains = (c.env.DOMAINS || "").split(",").map((d) => d.trim()).filter(Boolean);
+		const emailAddresses = (c.env.EMAIL_ADDRESSES ?? []) as string[];
+		try {
+			for (const alias of nextAliases) {
+				assertAliasAllowedByConfig(alias, { domains, emailAddresses });
+			}
+			await replaceMailboxAliases(c.env.BUCKET, mailboxId, previousAliases, nextAliases);
+		} catch (e) {
+			if (e instanceof AliasConflictError) return c.json({ error: e.message }, 409);
+			throw e;
+		}
+	}
+	const nextSettings = { ...settings, aliases: nextAliases };
+	await c.env.BUCKET.put(`mailboxes/${mailboxId}.json`, JSON.stringify(nextSettings));
+	return c.json({ id: mailboxId, name: mailboxId, email: mailboxId, aliases: nextAliases, settings: nextSettings });
 });
 
 app.delete("/api/v1/mailboxes/:mailboxId", async (c) => {
 	const mailboxId = c.req.param("mailboxId")!;
-	const key = `mailboxes/${mailboxId}.json`;
-	if (!(await c.env.BUCKET.head(key))) return c.json({ error: "Not found" }, 404);
-	await c.env.BUCKET.delete(key); // TODO: also delete DO data and R2 attachment blobs
+	const existing = await readMailboxSettings(c.env.BUCKET, mailboxId);
+	if (!existing) return c.json({ error: "Not found" }, 404);
+	await deleteMailboxAliases(c.env.BUCKET, existing.aliases, mailboxId);
+	await c.env.BUCKET.delete(`mailboxes/${mailboxId}.json`); // TODO: also delete DO data and R2 attachment blobs
+	await revokeAllMailboxTokens(c.env.BUCKET, mailboxId);
 	return c.body(null, 204);
+});
+
+app.get("/api/v1/mailboxes/:mailboxId/tokens", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	return c.json(await listMailboxTokens(c.env.BUCKET, mailboxId));
+});
+
+app.post("/api/v1/mailboxes/:mailboxId/tokens", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	const body = CreateTokenBody.parse(await c.req.json().catch(() => ({})));
+	const fromAddress = (body.fromAddress ?? mailboxId).toLowerCase();
+	const allowedFrom = await getMailboxAddresses(c.env.BUCKET, mailboxId);
+	if (!allowedFrom.includes(fromAddress)) {
+		return c.json({ error: "fromAddress must be the mailbox email or one of its aliases" }, 400);
+	}
+	try {
+		const created = await createMailboxToken(c.env.BUCKET, mailboxId, { fromAddress });
+		const origin = new URL(c.req.url).origin;
+		return c.json(
+			{
+				...created,
+				mcpUrl: `${origin}/mcp`,
+			},
+			201,
+		);
+	} catch (e) {
+		if (e instanceof TokenLimitError) return c.json({ error: e.message }, 400);
+		throw e;
+	}
+});
+
+app.delete("/api/v1/mailboxes/:mailboxId/tokens/:tokenId", async (c: AppContext) => {
+	const mailboxId = c.req.param("mailboxId")!;
+	const tokenId = c.req.param("tokenId")!;
+	const ok = await revokeMailboxToken(c.env.BUCKET, mailboxId, tokenId);
+	return ok ? c.body(null, 204) : c.json({ error: "Token not found" }, 404);
 });
 
 // -- Emails ---------------------------------------------------------
@@ -172,7 +276,7 @@ app.post("/api/v1/mailboxes/:mailboxId/emails", async (c: AppContext) => {
 
 	let toStr: string, fromEmail: string, fromDomain: string;
 	try {
-		({ toStr, fromEmail, fromDomain } = validateSender(to, from, mailboxId));
+		({ toStr, fromEmail, fromDomain } = await validateSenderForMailbox(c.env.BUCKET, to, from, mailboxId));
 	} catch (e) {
 		if (e instanceof SenderValidationError) return c.json({ error: e.message }, 400);
 		throw e;
@@ -356,15 +460,21 @@ async function receiveEmail(event: { raw: ReadableStream; rawSize: number }, env
 	const ccRecipients = (parsedEmail.cc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 	const bccRecipients = (parsedEmail.bcc || []).map((e) => e.address?.toLowerCase()).filter(Boolean) as string[];
 
-	let mailboxId: string | undefined;
-	if (allowedAddresses.length > 0) {
-		mailboxId = allRecipients.find((addr) => allowedAddresses.includes(addr));
-		if (!mailboxId) { console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`); return; }
-	} else { mailboxId = allRecipients[0]; }
-	if (!mailboxId) throw new Error("received email with no valid recipient address");
+	const candidateRecipients = allowedAddresses.length > 0
+		? allRecipients.filter((addr) => allowedAddresses.includes(addr))
+		: allRecipients;
+	if (allowedAddresses.length > 0 && candidateRecipients.length === 0) {
+		console.log(`Ignoring email: no recipient matches EMAIL_ADDRESSES.`);
+		return;
+	}
+
+	const mailboxId = await resolveInboundMailbox(env.BUCKET, candidateRecipients);
+	if (!mailboxId) {
+		console.log(`Ignoring email: no mailbox or alias matches recipients ${candidateRecipients.join(", ")}`);
+		return;
+	}
 
 	const messageId = crypto.randomUUID();
-	if (!(await env.BUCKET.head(`mailboxes/${mailboxId}.json`))) { console.log(`Ignoring email for ${mailboxId}: mailbox does not exist`); return; }
 
 	const stub = env.MAILBOX.get(env.MAILBOX.idFromName(mailboxId));
 

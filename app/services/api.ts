@@ -160,6 +160,27 @@ const api = {
 	// Search
 	searchEmails: (mailboxId: string, params: Record<string, string>) =>
 		get<EmailListResponse | Email[]>(`/api/v1/mailboxes/${mailboxId}/search`, { params }),
+
+	listMailboxTokens: (mailboxId: string) =>
+		get<MailboxToken[]>(`/api/v1/mailboxes/${mailboxId}/tokens`),
+	createMailboxToken: (mailboxId: string, fromAddress?: string) =>
+		post<CreatedMailboxToken>(`/api/v1/mailboxes/${mailboxId}/tokens`, {
+			fromAddress,
+		}),
+	revokeMailboxToken: (mailboxId: string, tokenId: string) =>
+		del<void>(`/api/v1/mailboxes/${mailboxId}/tokens/${tokenId}`),
 };
+
+export interface MailboxToken {
+	id: string;
+	prefix: string;
+	createdAt: string;
+	fromAddress?: string;
+}
+
+export interface CreatedMailboxToken extends MailboxToken {
+	token: string;
+	mcpUrl: string;
+}
 
 export default api;
