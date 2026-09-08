@@ -36,7 +36,7 @@
 		"@tiptap/react": "3.20.2",
 		"@tiptap/starter-kit": "3.20.2",
 		"agents": "^0.7.6",
-		"ai": "^6.0.116",
+		"ai": "^6.0.277",
 		"dompurify": "^3.4.13",
 		"drizzle-orm": "^0.45.2",
 		"hono": "^4.13.3",
