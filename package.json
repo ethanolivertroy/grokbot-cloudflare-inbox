@@ -83,7 +83,8 @@
 		"@tiptap/extension-strike": "3.32.0",
 		"@tiptap/extension-text": "3.32.0",
 		"miniflare": {
-			"sharp": "0.35.5"
+			"sharp": "0.35.5",
+			"undici": "7.30.1"
 		}
 	},
 	"devDependencies": {
