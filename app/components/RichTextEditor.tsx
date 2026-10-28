@@ -43,7 +43,13 @@ export default function RichTextEditor({
 			Underline,
 			TextAlign.configure({ types: ["heading", "paragraph"] }),
 			LinkExtension.configure({ openOnClick: false }),
-			TiptapImage,
+			// Tiptap 3.31.4+ leaves a stray ")" after the ![alt](src) input rule
+			// (ueberdosis/tiptap#8513), so keep typed markdown images as text.
+			TiptapImage.extend({
+				addInputRules() {
+					return [];
+				},
+			}),
 			TextStyle,
 			Color,
 			Highlight.configure({ multicolor: true }),

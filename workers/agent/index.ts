@@ -278,13 +278,27 @@ export class EmailAgent extends AIChatAgent<any> {
 		const result = streamText({
 			model: createAgentLanguageModel(env, models.agent),
 			system: systemPrompt,
-			messages: await convertToModelMessages(this.messages),
+			// ai >= 6.0.260 skips tools when a step ends with an unsafe finish
+			// reason (e.g. "length"), leaving a tool call with no result in the
+			// history. Drop those so later turns don't fail with
+			// MissingToolResultsError.
+			messages: await convertToModelMessages(this.messages, {
+				ignoreIncompleteToolCalls: true,
+			}),
 			tools,
 			stopWhen: stepCountIs(5),
 			onFinish,
 		});
 
-		return result.toUIMessageStreamResponse();
+		// Send the reply's message id in the stream's start chunk so the client
+		// and AIChatAgent store the reply under the same id. Without it,
+		// AIChatAgent 0.1.x matches the client's copy by content, which fails
+		// once ai >= 6.0.253 adds ids to reasoning parts, so replies get saved
+		// twice.
+		return result.toUIMessageStreamResponse({
+			originalMessages: this.messages,
+			generateMessageId: () => crypto.randomUUID(),
+		});
 	}
 
 	/**
